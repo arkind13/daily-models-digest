@@ -1,3 +1,5 @@
+# python daily_digest.py
+
 #!/usr/bin/env python3
 """
 daily_digest.py — Daily automation digest.
@@ -19,6 +21,7 @@ import os
 import re
 import time
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 import requests
 from dotenv import load_dotenv
@@ -56,6 +59,7 @@ TELEGRAM_MAX_LENGTH = 4096
 HTTP_TIMEOUT = 30
 SEPARATOR = "━━━━━━━━━━━━━━━━━━━━━━"
 DESCRIPTION_MAX_CHARS = 160
+SYDNEY_TZ = ZoneInfo("Australia/Sydney")
 
 try:
     from google import genai
@@ -70,6 +74,28 @@ except ImportError:
 # Small utilities
 # ---------------------------------------------------------------------------
 
+
+def to_sydney(dt):
+    """Convert a datetime to Australia/Sydney. Accepts aware or naive (assumed UTC)."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(SYDNEY_TZ)
+
+
+def format_sydney(dt, with_time=True):
+    """
+    Format a datetime in Sydney local time.
+    Example: 2026-07-23 14:30 AEST   or   2026-07-23 14:30 AEDT
+    """
+    local = to_sydney(dt)
+    if local is None:
+        return "N/A"
+    # %Z → AEST or AEDT depending on DST
+    if with_time:
+        return local.strftime("%Y-%m-%d %H:%M %Z")
+    return local.strftime("%Y-%m-%d %Z")
 
 def safe_err(exc, limit=300):
     """Truncated error string — never log full responses/URLs (may hold keys)."""
@@ -568,9 +594,12 @@ def format_videos_message(model_name, videos):
             lines.append("")
         lines.append(html.escape(str(v.get("title") or "Untitled")))
         lines.append(f"🔗 {html.escape(str(v.get('url') or ''))}")
-        lines.append(f"👍 {format_count(v.get('likeCount'))} | "
-                     f"👁 {format_count(v.get('viewCount'))} | "
-                     f"📅 {v['_published_dt'].strftime('%Y-%m-%d')}")
+        published = format_sydney(v.get("_published_dt"))
+        lines.append(
+            f"👍 {format_count(v.get('likeCount'))} | "
+            f"👁 {format_count(v.get('viewCount'))} | "
+            f"📅 {published}"
+        )
         lines.append(SEPARATOR)
     return "\n".join(lines)
 
@@ -651,6 +680,7 @@ def fetch_recent_channel_videos(channel_id, since_ts):
                 "video_id": video_id,
                 "title": snippet.get("title") or "Untitled",
                 "channel_title": snippet.get("channelTitle") or "Unknown channel",
+                "_published_dt": published_dt,
             })
     if not recent:
         return []
@@ -682,9 +712,14 @@ def fetch_recent_channel_videos(channel_id, since_ts):
 def format_channel_message(channel_title, videos):
     lines = [f"📺 <b>NEW FROM {html.escape(channel_title)}</b> (last 24h)", SEPARATOR]
     for v in videos:
+        published = format_sydney(v.get("_published_dt"))
         lines.append(f"• {html.escape(v['title'])}")
         lines.append(f"  🔗 https://youtube.com/watch?v={v['video_id']}")
-        lines.append(f"  👁 {format_count(v['views'])} views | 👍 {format_count(v['likes'])}")
+        lines.append(
+            f"  👁 {format_count(v['views'])} views | "
+            f"👍 {format_count(v['likes'])} | "
+            f"📅 {published}"
+        )
         lines.append(SEPARATOR)
     return "\n".join(lines)
 
