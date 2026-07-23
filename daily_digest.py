@@ -1,5 +1,3 @@
-# python daily_digest.py
-
 #!/usr/bin/env python3
 """
 daily_digest.py — Daily automation digest.
@@ -33,10 +31,9 @@ load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")  # optional / future use
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
 
-# Gemini is kept for potential future use; video search now uses YouTube API directly.
 GEMINI_MODEL = "gemini-2.0-flash"
 
 YOUTUBE_CHANNELS = [
@@ -47,7 +44,10 @@ YOUTUBE_CHANNELS = [
     "UC-CSyyi47VX1lD9zyeABW3w",  # Dhruv Rathee
 ]
 
-OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models?sort=newest"
+# IMPORTANT: default API is text-only; "all" includes audio/image/embeddings
+OPENROUTER_MODELS_URL = (
+    "https://openrouter.ai/api/v1/models?sort=newest&output_modalities=all"
+)
 YOUTUBE_SEARCH_URL = "https://www.googleapis.com/youtube/v3/search"
 YOUTUBE_VIDEOS_URL = "https://www.googleapis.com/youtube/v3/videos"
 
@@ -55,14 +55,13 @@ DAY_IN_SECONDS = 86400
 TELEGRAM_MAX_LENGTH = 4096
 HTTP_TIMEOUT = 30
 SEPARATOR = "━━━━━━━━━━━━━━━━━━━━━━"
+DESCRIPTION_MAX_CHARS = 160
 
-# google-genai SDK — optional import so the script never crashes if missing.
-# Note: video search no longer relies on Gemini (uses YouTube API directly).
 try:
     from google import genai
     from google.genai import types as genai_types
     GENAI_AVAILABLE = True
-except ImportError:  # FIX #5: catch ImportError only, not SystemExit/KeyboardInterrupt
+except ImportError:
     genai = None
     genai_types = None
     GENAI_AVAILABLE = False
@@ -78,8 +77,7 @@ def safe_err(exc, limit=300):
 
 
 def raise_for_status_safe(resp, label):
-    """Like resp.raise_for_status() but never embeds the URL (which may
-    contain the Telegram token / YouTube API key) in the exception text."""
+    """Like resp.raise_for_status() but never embeds the URL in the exception."""
     if not resp.ok:
         raise RuntimeError(f"{label} returned HTTP {resp.status_code}")
 
@@ -90,14 +88,7 @@ def utf16_len(text):
 
 
 def utf16_slice(text, utf16_offset, utf16_length):
-    """
-    Slice a string by UTF-16 code units rather than Unicode code points.
-
-    This is necessary because Telegram measures message length in UTF-16
-    code units, and slicing by Python's code-point indexing can produce
-    slices whose UTF-16 length differs from the expected count (e.g. emoji
-    occupy 2 UTF-16 code units but only 1 Python code point).
-    """
+    """Slice a string by UTF-16 code units rather than Unicode code points."""
     encoded = text.encode("utf-16-le")
     byte_start = utf16_offset * 2
     byte_end = (utf16_offset + utf16_length) * 2
@@ -105,22 +96,15 @@ def utf16_slice(text, utf16_offset, utf16_length):
 
 
 def split_message(text, limit=TELEGRAM_MAX_LENGTH):
-    """Split text into chunks under the Telegram limit, on line boundaries.
-
-    Uses UTF-16-aware splitting to handle emoji and other non-BMP characters
-    that take 2 UTF-16 code units each.
-    """
+    """Split text into chunks under the Telegram limit, on line boundaries."""
     if utf16_len(text) <= limit:
         return [text]
     chunks, current_lines, current_len = [], [], 0
     for line in text.split("\n"):
-        # Pathological single long line — split with UTF-16 awareness
         while utf16_len(line) > limit:
             if current_lines:
                 chunks.append("\n".join(current_lines))
                 current_lines, current_len = [], 0
-            # Binary search: find the largest code-point prefix whose
-            # UTF-16 length fits within `limit`.
             lo, hi = 0, len(line)
             while lo < hi:
                 mid = (lo + hi + 1) // 2
@@ -128,10 +112,7 @@ def split_message(text, limit=TELEGRAM_MAX_LENGTH):
                     lo = mid
                 else:
                     hi = mid - 1
-            # lo is now the max number of code points we can take.
-            # (lo is guaranteed >= 1 since even a single emoji is only 2 UTF-16 units.)
-            chunk = line[:lo]
-            chunks.append(chunk)
+            chunks.append(line[:lo])
             line = line[lo:]
         added = utf16_len(line) + (1 if current_lines else 0)
         if current_lines and current_len + added > limit:
@@ -158,22 +139,199 @@ def format_count(value):
     return str(n)
 
 
-def format_price(raw):
-    """OpenRouter pricing is USD per token (string). Show USD per 1M tokens."""
+def _to_float(raw):
+    """Parse an OpenRouter price string/number; return None if missing/invalid."""
+    if raw is None or raw == "":
+        return None
     try:
-        per_million = float(raw) * 1_000_000
+        return float(raw)
     except (TypeError, ValueError):
-        return "N/A"
+        return None
+
+
+def format_price_per_million(raw):
+    """USD-per-token string → human USD per 1M tokens."""
+    val = _to_float(raw)
+    if val is None:
+        return None
+    per_million = val * 1_000_000
     if per_million == 0:
         return "0.00"
     if per_million < 0.01:
         return f"{per_million:.4f}"
+    if per_million < 1:
+        return f"{per_million:.3f}"
     return f"{per_million:.2f}"
 
 
+def format_price_per_unit(raw, unit_label):
+    """USD-per-unit (image, request, etc.)."""
+    val = _to_float(raw)
+    if val is None:
+        return None
+    if val == 0:
+        return f"0.00/{unit_label}"
+    if val < 0.0001:
+        return f"{val:.6f}/{unit_label}"
+    if val < 0.01:
+        return f"{val:.4f}/{unit_label}"
+    return f"{val:.2f}/{unit_label}"
+
+
+def format_price(raw):
+    """Backward-compatible wrapper: USD per 1M tokens, or 'N/A'."""
+    formatted = format_price_per_million(raw)
+    return formatted if formatted is not None else "N/A"
+
+
+def get_modalities(model):
+    """Return (input_modalities, output_modalities) lists."""
+    arch = model.get("architecture") or {}
+    in_mods = arch.get("input_modalities") or []
+    out_mods = arch.get("output_modalities") or []
+    # Fallbacks for older/partial payloads
+    if not in_mods and not out_mods:
+        modality = arch.get("modality") or ""
+        if "->" in str(modality):
+            left, right = str(modality).split("->", 1)
+            in_mods = [p.strip() for p in left.split("+") if p.strip()]
+            out_mods = [p.strip() for p in right.split("+") if p.strip()]
+        elif modality:
+            out_mods = [str(modality)]
+    if not out_mods:
+        out_mods = ["text"]
+    if not in_mods:
+        in_mods = ["text"]
+    return list(in_mods), list(out_mods)
+
+
+def format_modalities(model):
+    """e.g. 'text → audio' or 'text+image → text'."""
+    in_mods, out_mods = get_modalities(model)
+    left = "+".join(in_mods) if in_mods else "?"
+    right = "+".join(out_mods) if out_mods else "?"
+    return f"{left} → {right}"
+
+
+def format_pricing_line(model):
+    """
+    Build a single human-readable pricing line from OpenRouter pricing.
+
+    OpenRouter prices are USD per token / per image / per request / etc.
+    Token prices are shown per 1M tokens; other units keep their native scale.
+    """
+    pricing = model.get("pricing") or {}
+    if not isinstance(pricing, dict) or not pricing:
+        return "N/A"
+
+    # Accept both API snake_case and occasional camelCase from docs/SDKs
+    def p(*keys):
+        for k in keys:
+            if k in pricing and pricing[k] is not None:
+                return pricing[k]
+        return None
+
+    parts = []
+
+    prompt = p("prompt")
+    completion = p("completion")
+    prompt_s = format_price_per_million(prompt)
+    completion_s = format_price_per_million(completion)
+
+    # Token I/O — show if either side exists (embeddings often have prompt only)
+    if prompt_s is not None or completion_s is not None:
+        if prompt_s is not None and completion_s is not None:
+            if prompt_s == "0.00" and completion_s == "0.00":
+                parts.append("Free")
+            else:
+                parts.append(f"${prompt_s} / ${completion_s} per 1M tokens (in/out)")
+        elif prompt_s is not None:
+            label = "Free input" if abs(_to_float(prompt) or 0) == 0 else (
+                f"${prompt_s} per 1M input tokens"
+            )
+            parts.append(label)
+        else:
+            label = "Free output" if abs(_to_float(completion) or 0) == 0 else (
+                f"${completion_s} per 1M output tokens"
+            )
+            parts.append(label)
+
+    # Audio (STT input / TTS output) — USD per audio token, shown per 1M
+    audio_in = p("audio", "audio_input")
+    audio_out = p("audio_output", "audioOutput")
+    audio_in_s = format_price_per_million(audio_in)
+    audio_out_s = format_price_per_million(audio_out)
+    if audio_in_s is not None and (_to_float(audio_in) or 0) > 0:
+        parts.append(f"${audio_in_s} per 1M audio input tokens")
+    if audio_out_s is not None and (_to_float(audio_out) or 0) > 0:
+        parts.append(f"${audio_out_s} per 1M audio output tokens")
+
+    # Images
+    image_in = p("image")
+    image_out = p("image_output", "imageOutput")
+    image_tok = p("image_token", "imageToken")
+    img_in_u = format_price_per_unit(image_in, "input image")
+    img_out_u = format_price_per_unit(image_out, "output image")
+    if img_in_u and (_to_float(image_in) or 0) > 0:
+        parts.append(f"${img_in_u}")
+    if img_out_u and (_to_float(image_out) or 0) > 0:
+        parts.append(f"${img_out_u}")
+    img_tok_s = format_price_per_million(image_tok)
+    if img_tok_s is not None and (_to_float(image_tok) or 0) > 0:
+        parts.append(f"${img_tok_s} per 1M image tokens")
+
+    # Fixed per-request fee
+    request = p("request")
+    req_u = format_price_per_unit(request, "request")
+    if req_u and (_to_float(request) or 0) > 0:
+        parts.append(f"${req_u}")
+
+    # Reasoning / cache / search — only if non-zero (keeps message short)
+    extras = [
+        (p("internal_reasoning", "internalReasoning"), "reasoning tokens", True),
+        (p("input_cache_read", "inputCacheRead"), "cache-read tokens", True),
+        (p("input_cache_write", "inputCacheWrite"), "cache-write tokens", True),
+        (p("input_audio_cache", "inputAudioCache"), "audio cache tokens", True),
+        (p("web_search", "webSearch"), "web search", False),
+    ]
+    for raw, label, per_million in extras:
+        val = _to_float(raw)
+        if val is None or val <= 0:
+            continue
+        if per_million:
+            s = format_price_per_million(raw)
+            if s:
+                parts.append(f"${s} per 1M {label}")
+        else:
+            u = format_price_per_unit(raw, label)
+            if u:
+                parts.append(f"${u}")
+
+    if not parts:
+        # All zeros / empty → treat as free
+        if any(_to_float(v) == 0 for v in pricing.values() if not isinstance(v, (list, dict))):
+            return "Free"
+        return "N/A"
+
+    # De-dupe while preserving order ("Free" alone is enough)
+    if parts == ["Free"] or (len(parts) == 1 and parts[0] == "Free"):
+        return "Free"
+    # If we already said Free for tokens but have paid extras, drop bare Free
+    if parts[0] == "Free" and len(parts) > 1:
+        parts = parts[1:]
+
+    return " · ".join(parts)
+
+
+def truncate_text(text, limit=DESCRIPTION_MAX_CHARS):
+    text = re.sub(r"\s+", " ", (text or "").strip())
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)].rstrip() + "…"
+
+
 def parse_datetime(value):
-    """Tolerant parser for ISO-8601 / common date strings / unix timestamps.
-    Returns timezone-aware datetime or None."""
+    """Tolerant parser for ISO-8601 / common date strings / unix timestamps."""
     if value is None:
         return None
     if isinstance(value, (int, float)):
@@ -204,7 +362,6 @@ def parse_json_array(text):
     cleaned = re.sub(r"\s*```$", "", cleaned)
     start, end = cleaned.find("["), cleaned.rfind("]")
     if start == -1 or end == -1 or end < start:
-        # Tolerate a single object instead of an array.
         o_start, o_end = cleaned.find("{"), cleaned.rfind("}")
         if o_start != -1 and o_end > o_start:
             try:
@@ -244,7 +401,6 @@ def send_telegram(text):
                 print("[telegram] Rate limited (429) — skipping this message.")
                 return
             if resp.status_code == 400:
-                # Probably an HTML entity problem — retry as plain text.
                 print("[telegram] HTTP 400 — retrying without parse_mode.")
                 payload.pop("parse_mode", None)
                 resp = requests.post(url, json=payload, timeout=HTTP_TIMEOUT)
@@ -269,6 +425,8 @@ def fetch_new_models(since_ts):
         raise_for_status_safe(resp, "OpenRouter")
         models = resp.json().get("data", [])
         new_models = [m for m in models if int(m.get("created") or 0) >= since_ts]
+        # Newest first (API usually is, but don't rely on it after filtering)
+        new_models.sort(key=lambda m: int(m.get("created") or 0), reverse=True)
         print(f"[openrouter] Fetched {len(models)} models total, "
               f"{len(new_models)} new in the last 24h.")
         return new_models
@@ -286,19 +444,33 @@ def fetch_new_models(since_ts):
 def format_model_summary(models):
     lines = ["📋 <b>NEW MODELS ON OPENROUTER</b>", SEPARATOR]
     for m in models:
-        name = html.escape(str(m.get("name") or m.get("id") or "Unknown model"))
-        pricing = m.get("pricing") or {}
-        prompt_price = format_price(pricing.get("prompt"))
-        completion_price = format_price(pricing.get("completion"))
+        model_id = str(m.get("id") or "")
+        name = html.escape(str(m.get("name") or model_id or "Unknown model"))
+        pricing_line = html.escape(format_pricing_line(m))
+        modality_line = html.escape(format_modalities(m))
         released = datetime.fromtimestamp(
-            int(m.get("created") or 0), tz=timezone.utc).strftime("%Y-%m-%d")
+            int(m.get("created") or 0), tz=timezone.utc
+        ).strftime("%Y-%m-%d %H:%M UTC")
         context = m.get("context_length")
-        context_str = f"{int(context):,}" if isinstance(context, (int, float)) else "N/A"
+        if isinstance(context, (int, float)) and context > 0:
+            context_str = f"{int(context):,}"
+        else:
+            context_str = "N/A"
+
         lines.append(f"• <b>Model:</b> {name}")
-        lines.append(f"  <b>Pricing:</b> ${prompt_price} / ${completion_price} per 1M tokens")
+        if model_id:
+            lines.append(f"  <b>ID:</b> <code>{html.escape(model_id)}</code>")
+        lines.append(f"  <b>Modality:</b> {modality_line}")
+        lines.append(f"  <b>Pricing:</b> {pricing_line}")
         lines.append(f"  <b>Released:</b> {released}")
         lines.append(f"  <b>Context:</b> {context_str}")
+
+        desc = truncate_text(m.get("description") or "")
+        if desc:
+            lines.append(f"  <b>About:</b> {html.escape(desc)}")
+
         lines.append(SEPARATOR)
+
     lines.append(f"<b>Total:</b> {len(models)} new model(s)")
     return "\n".join(lines)
 
@@ -312,24 +484,19 @@ def search_youtube_videos(query, since_ts, max_results=2):
     Search YouTube using the Data API v3 for videos matching `query`
     published after `since_ts`. Returns a list of video dicts with
     real metadata, or None on API failure, or [] if no results.
-
-    This replaces the old Gemini-based search which hallucinated URLs
-    and statistics. The YouTube API returns real, verified data.
     """
     if not YOUTUBE_API_KEY:
         print("[youtube] YOUTUBE_API_KEY not set — video search unavailable.")
         return None
 
-    # RFC 3339 format (ISO 8601) required by YouTube API
     published_after = datetime.fromtimestamp(since_ts, tz=timezone.utc).isoformat()
 
     try:
-        # Step 1: Search for videos matching the query
         search_params = {
             "part": "snippet",
             "q": query,
             "order": "relevance",
-            "maxResults": min(max_results * 2, 5),  # fetch extra, filter down
+            "maxResults": min(max_results * 2, 5),
             "type": "video",
             "publishedAfter": published_after,
             "key": YOUTUBE_API_KEY,
@@ -347,14 +514,12 @@ def search_youtube_videos(query, since_ts, max_results=2):
             print(f"[youtube] No search results for '{query}'.")
             return []
 
-        # Step 2: Collect video IDs for statistics lookup
         video_ids = []
         for item in search_items:
             vid = (item.get("id") or {}).get("videoId")
             if vid:
                 video_ids.append(vid)
 
-        # Step 3: Fetch statistics (views, likes) for the found videos
         stats_params = {
             "part": "statistics,snippet",
             "id": ",".join(video_ids),
@@ -366,7 +531,6 @@ def search_youtube_videos(query, since_ts, max_results=2):
         raise_for_status_safe(stats_resp, "YouTube videos")
         stats_items = stats_resp.json().get("items", [])
 
-        # Step 4: Build result list with real verified data
         videos = []
         for item in stats_items:
             snippet = item.get("snippet") or {}
@@ -383,7 +547,6 @@ def search_youtube_videos(query, since_ts, max_results=2):
                 "_published_dt": published_dt,
             })
 
-        # Sort by engagement (views + likes) descending
         videos.sort(key=lambda v: v["viewCount"] + v["likeCount"], reverse=True)
         result = videos[:max_results]
         print(f"[youtube] {len(result)} real video(s) found for '{query}'.")
@@ -412,27 +575,45 @@ def format_videos_message(model_name, videos):
     return "\n".join(lines)
 
 
+def youtube_query_for_model(model):
+    """
+    Build a YouTube search query. Prefer the human name; strip noisy free/suffix tags.
+    Fall back to the bare model slug without vendor if name is empty.
+    """
+    model_id = str(model.get("id") or "")
+    name = str(model.get("name") or "").strip()
+    if name:
+        # "InclusionAI: Ling 3.0 Flash (free)" → "InclusionAI Ling 3.0 Flash"
+        cleaned = re.sub(r"\s*\(free\)\s*", " ", name, flags=re.I)
+        cleaned = cleaned.replace(":", " ")
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        return cleaned
+    if "/" in model_id:
+        return model_id.split("/", 1)[1].replace(":", " ").replace("-", " ")
+    return model_id or "AI model"
+
+
 def process_model(model):
     """Steps 3a–3c for a single model. Never raises."""
     model_id = str(model.get("id") or "")
     model_name = str(model.get("name") or model_id or "Unknown model")
-    vendor = model_id.split("/")[0] if "/" in model_id else "unknown vendor"
     created_ts = int(model.get("created") or 0)
 
-    print(f"[videos] Searching YouTube (via Data API v3) for: {model_name}")
+    query = youtube_query_for_model(model)
+    print(f"[videos] Searching YouTube (via Data API v3) for: {model_name} (q={query!r})")
     videos = search_youtube_videos(
-        query=model_name,
+        query=query,
         since_ts=created_ts,  # only videos published after the model release
         max_results=2,
     )
 
-    if videos is None:  # YouTube API failure
+    if videos is None:
         send_telegram(f"🎥 <b>VIDEOS FOR {html.escape(model_name)}</b>\n"
                       f"{SEPARATOR}\n"
                       "⚠️ Video search unavailable")
         return
 
-    if not videos:  # No results found
+    if not videos:
         send_telegram(f'❌ No YouTube videos found yet for "{html.escape(model_name)}"')
         print(f"[videos] No videos found for: {model_name}")
         return
@@ -446,8 +627,7 @@ def process_model(model):
 
 
 def fetch_recent_channel_videos(channel_id, since_ts):
-    """Return up to 2 videos from a channel published since `since_ts`,
-    enriched with statistics, sorted by view count. [] if none."""
+    """Return up to 2 videos from a channel published since `since_ts`."""
     resp = requests.get(YOUTUBE_SEARCH_URL, params={
         "part": "snippet",
         "channelId": channel_id,
@@ -475,7 +655,6 @@ def fetch_recent_channel_videos(channel_id, since_ts):
     if not recent:
         return []
 
-    # Statistics for the matching videos.
     stats = {}
     try:
         stats_resp = requests.get(YOUTUBE_VIDEOS_URL, params={
@@ -518,7 +697,7 @@ def check_tracked_channels(since_ts):
 
     any_uploads = False
     successes = 0
-    errors = []  # FIX #4: collect errors, send one consolidated message
+    errors = []
     for channel_id in YOUTUBE_CHANNELS:
         try:
             videos = fetch_recent_channel_videos(channel_id, since_ts)
@@ -534,9 +713,8 @@ def check_tracked_channels(since_ts):
         channel_title = videos[0]["channel_title"]
         send_telegram(format_channel_message(channel_title, videos))
         print(f"[youtube] Sent channel update: {channel_title}")
-        time.sleep(1)  # be gentle with the Telegram API
+        time.sleep(1)
 
-    # FIX #4: send a single error message instead of one per failed channel
     if errors:
         send_telegram(f"⚠️ YouTube search unavailable for {len(errors)} channel(s)")
 
@@ -550,14 +728,16 @@ def check_tracked_channels(since_ts):
 
 
 def check_config():
+    # Gemini is optional now (video path uses YouTube API).
     missing = [name for name, val in (
         ("TELEGRAM_TOKEN", TELEGRAM_TOKEN),
         ("TELEGRAM_CHAT_ID", TELEGRAM_CHAT_ID),
-        ("GEMINI_API_KEY", GEMINI_API_KEY),
         ("YOUTUBE_API_KEY", YOUTUBE_API_KEY),
     ) if not val]
     if missing:
         print(f"[config] Missing environment variables: {', '.join(missing)}")
+    if not GEMINI_API_KEY:
+        print("[config] GEMINI_API_KEY not set — optional, fine for current flow.")
     if not GENAI_AVAILABLE:
         print("[config] google-genai SDK not importable — Gemini functionality unavailable "
               "(video search uses YouTube API directly, so this is fine).")
@@ -568,7 +748,6 @@ def main():
     check_config()
     since_ts = time.time() - DAY_IN_SECONDS
 
-    # ---- Steps 1–3: OpenRouter models ----
     models = fetch_new_models(since_ts)
     if models is None:
         print("[main] OpenRouter fetch failed — skipping to channel check.")
@@ -584,9 +763,8 @@ def main():
                 process_model(model)
             except Exception as exc:
                 print(f"[main] Unexpected error processing model: {safe_err(exc)}")
-            time.sleep(1)  # be gentle with YouTube + Telegram rate limits
+            time.sleep(1)
 
-    # ---- Step 4: tracked YouTube channels ----
     try:
         check_tracked_channels(since_ts)
     except Exception as exc:
@@ -598,7 +776,7 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except Exception as exc:  # last-resort guard: the script must never crash
+    except Exception as exc:
         print(f"[fatal] Unhandled error: {safe_err(exc)}")
         try:
             send_telegram(f"⚠️ daily_digest failed: {html.escape(safe_err(exc))}")
