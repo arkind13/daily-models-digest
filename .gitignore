@@ -1,0 +1,7 @@
+# Environment files 
+config.env 
+__pycache__/ 
+*.pyc 
+.DS_Store 
+config.env 
+*.docx 
