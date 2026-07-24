@@ -97,6 +97,7 @@ def format_sydney(dt, with_time=True):
         return local.strftime("%Y-%m-%d %H:%M %Z")
     return local.strftime("%Y-%m-%d %Z")
 
+
 def safe_err(exc, limit=300):
     """Truncated error string — never log full responses/URLs (may hold keys)."""
     return str(exc)[:limit]
@@ -381,6 +382,40 @@ def parse_datetime(value):
     return None
 
 
+def duration_seconds(iso_duration):
+    """Parse YouTube ISO-8601 duration (e.g. PT1M30S) → total seconds, or None."""
+    if not iso_duration:
+        return None
+    match = re.match(r"^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$", str(iso_duration))
+    if not match:
+        return None
+    hours = int(match.group(1) or 0)
+    minutes = int(match.group(2) or 0)
+    seconds = int(match.group(3) or 0)
+    return hours * 3600 + minutes * 60 + seconds
+
+
+def is_youtube_short(iso_duration):
+    """YouTube Shorts are videos ≤ 60 seconds."""
+    secs = duration_seconds(iso_duration)
+    return secs is not None and secs <= 60
+
+
+def is_english_video(snippet):
+    """
+    True if the video looks English.
+    Accepts missing language tags (common) — only rejects explicit non-English.
+    """
+    lang = (
+        snippet.get("defaultAudioLanguage")
+        or snippet.get("defaultLanguage")
+        or ""
+    ).strip().lower()
+    if not lang:
+        return True
+    return lang == "en" or lang.startswith("en-") or lang.startswith("en_")
+
+
 def parse_json_array(text):
     """Extract a JSON array from an LLM response (tolerates code fences)."""
     cleaned = text.strip()
@@ -505,28 +540,44 @@ def format_model_summary(models):
 # ---------------------------------------------------------------------------
 
 
-def search_youtube_videos(query, since_ts, max_results=2):
+def search_youtube_videos(
+    query,
+    since_ts,
+    max_results=2,
+    exclude_channel_ids=None,
+    english_only=False,
+):
     """
     Search YouTube using the Data API v3 for videos matching `query`
     published after `since_ts`. Returns a list of video dicts with
     real metadata, or None on API failure, or [] if no results.
+
+    Always skips YouTube Shorts (duration ≤ 60s).
+    When english_only=True (model reviews), biases search to English and
+    drops videos with an explicit non-English default language.
+    exclude_channel_ids: channels already used for another model's review.
     """
     if not YOUTUBE_API_KEY:
         print("[youtube] YOUTUBE_API_KEY not set — video search unavailable.")
         return None
 
+    exclude_channel_ids = exclude_channel_ids or set()
     published_after = datetime.fromtimestamp(since_ts, tz=timezone.utc).isoformat()
 
     try:
+        # Pull extras so Shorts / language / already-used channels can be filtered
         search_params = {
             "part": "snippet",
             "q": query,
             "order": "relevance",
-            "maxResults": min(max_results * 2, 5),
+            "maxResults": min(max(max_results * 8, 15), 25),
             "type": "video",
             "publishedAfter": published_after,
             "key": YOUTUBE_API_KEY,
         }
+        if english_only:
+            search_params["relevanceLanguage"] = "en"
+
         search_resp = requests.get(
             YOUTUBE_SEARCH_URL, params=search_params, timeout=HTTP_TIMEOUT
         )
@@ -547,7 +598,7 @@ def search_youtube_videos(query, since_ts, max_results=2):
                 video_ids.append(vid)
 
         stats_params = {
-            "part": "statistics,snippet",
+            "part": "statistics,snippet,contentDetails",
             "id": ",".join(video_ids),
             "key": YOUTUBE_API_KEY,
         }
@@ -558,20 +609,43 @@ def search_youtube_videos(query, since_ts, max_results=2):
         stats_items = stats_resp.json().get("items", [])
 
         videos = []
+        seen_channels = set()
         for item in stats_items:
             snippet = item.get("snippet") or {}
             statistics = item.get("statistics") or {}
+            content_details = item.get("contentDetails") or {}
             published_dt = parse_datetime(snippet.get("publishedAt"))
             if published_dt is None or published_dt.timestamp() < since_ts:
                 continue
+
+            # 1) Ignore Shorts
+            if is_youtube_short(content_details.get("duration")):
+                continue
+
+            # 3) Model reviews: English only
+            if english_only and not is_english_video(snippet):
+                continue
+
+            channel_id = snippet.get("channelId") or ""
+
+            # 2) Only one video per channel (within this model + across models)
+            if channel_id and channel_id in exclude_channel_ids:
+                continue
+            if channel_id and channel_id in seen_channels:
+                continue
+
             videos.append({
                 "title": snippet.get("title") or "Untitled",
                 "url": f"https://youtube.com/watch?v={item['id']}",
                 "viewCount": int(statistics.get("viewCount") or 0),
                 "likeCount": int(statistics.get("likeCount") or 0),
                 "publishedAt": snippet.get("publishedAt", ""),
+                "channelId": channel_id,
+                "channelTitle": snippet.get("channelTitle") or "",
                 "_published_dt": published_dt,
             })
+            if channel_id:
+                seen_channels.add(channel_id)
 
         videos.sort(key=lambda v: v["viewCount"] + v["likeCount"], reverse=True)
         result = videos[:max_results]
@@ -622,8 +696,15 @@ def youtube_query_for_model(model):
     return model_id or "AI model"
 
 
-def process_model(model):
-    """Steps 3a–3c for a single model. Never raises."""
+def process_model(model, used_channel_ids=None):
+    """Steps 3a–3c for a single model. Never raises.
+
+    used_channel_ids: shared set so a channel only appears once across
+    all model-review messages in this run.
+    """
+    if used_channel_ids is None:
+        used_channel_ids = set()
+
     model_id = str(model.get("id") or "")
     model_name = str(model.get("name") or model_id or "Unknown model")
     created_ts = int(model.get("created") or 0)
@@ -634,6 +715,8 @@ def process_model(model):
         query=query,
         since_ts=created_ts,  # only videos published after the model release
         max_results=2,
+        exclude_channel_ids=used_channel_ids,
+        english_only=True,
     )
 
     if videos is None:
@@ -647,6 +730,11 @@ def process_model(model):
         print(f"[videos] No videos found for: {model_name}")
         return
 
+    for v in videos:
+        cid = v.get("channelId")
+        if cid:
+            used_channel_ids.add(cid)
+
     send_telegram(format_videos_message(model_name, videos))
     print(f"[videos] Sent video message for: {model_name}")
 
@@ -656,12 +744,12 @@ def process_model(model):
 
 
 def fetch_recent_channel_videos(channel_id, since_ts):
-    """Return up to 2 videos from a channel published since `since_ts`."""
+    """Return up to 2 non-Short videos from a channel published since `since_ts`."""
     resp = requests.get(YOUTUBE_SEARCH_URL, params={
         "part": "snippet",
         "channelId": channel_id,
         "order": "date",
-        "maxResults": 5,
+        "maxResults": 10,
         "type": "video",
         "key": YOUTUBE_API_KEY,
     }, timeout=HTTP_TIMEOUT)
@@ -685,10 +773,10 @@ def fetch_recent_channel_videos(channel_id, since_ts):
     if not recent:
         return []
 
-    stats = {}
+    details = {}
     try:
         stats_resp = requests.get(YOUTUBE_VIDEOS_URL, params={
-            "part": "statistics",
+            "part": "statistics,contentDetails",
             "id": ",".join(v["video_id"] for v in recent),
             "key": YOUTUBE_API_KEY,
         }, timeout=HTTP_TIMEOUT)
@@ -696,17 +784,29 @@ def fetch_recent_channel_videos(channel_id, since_ts):
             print("[youtube] Rate limited (429) on statistics — using zeros.")
         else:
             raise_for_status_safe(stats_resp, "YouTube videos")
-            stats = {it["id"]: it.get("statistics") or {}
-                     for it in stats_resp.json().get("items", [])}
+            details = {
+                it["id"]: {
+                    "statistics": it.get("statistics") or {},
+                    "contentDetails": it.get("contentDetails") or {},
+                }
+                for it in stats_resp.json().get("items", [])
+            }
     except Exception as exc:
         print(f"[youtube] Statistics fetch failed: {safe_err(exc)}")
 
+    filtered = []
     for v in recent:
-        s = stats.get(v["video_id"], {})
+        d = details.get(v["video_id"], {})
+        # 1) Ignore Shorts for channel digests too
+        if is_youtube_short((d.get("contentDetails") or {}).get("duration")):
+            continue
+        s = d.get("statistics") or {}
         v["views"] = int(s.get("viewCount") or 0)
         v["likes"] = int(s.get("likeCount") or 0)
-    recent.sort(key=lambda v: v["views"], reverse=True)
-    return recent[:2]
+        filtered.append(v)
+
+    filtered.sort(key=lambda v: v["views"], reverse=True)
+    return filtered[:2]
 
 
 def format_channel_message(channel_title, videos):
@@ -793,9 +893,11 @@ def main():
         print(f"[main] Fetched {len(models)} new model(s).")
         send_telegram(format_model_summary(models))
         print("[main] Sent model summary.")
+        # One video per channel across all model reviews (avoids duplicates)
+        used_channel_ids = set()
         for model in models:
             try:
-                process_model(model)
+                process_model(model, used_channel_ids=used_channel_ids)
             except Exception as exc:
                 print(f"[main] Unexpected error processing model: {safe_err(exc)}")
             time.sleep(1)
