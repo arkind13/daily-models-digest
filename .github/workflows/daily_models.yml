@@ -2,8 +2,7 @@ name: Daily Models Digest
 
 on:
   schedule:
-        # Runs at 05:35 AM Sydney time (AEST = UTC+10, so 20:00 UTC)
-    - cron: '1 21 * * *'
+    - cron: '17 20 * * *'  # Runs at 06:17 AM Sydney time (20:17 UTC)
   workflow_dispatch:
 
 jobs:
@@ -12,10 +11,10 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
