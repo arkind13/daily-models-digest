@@ -386,19 +386,35 @@ def duration_seconds(iso_duration):
     """Parse YouTube ISO-8601 duration (e.g. PT1M30S) → total seconds, or None."""
     if not iso_duration:
         return None
-    match = re.match(r"^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$", str(iso_duration))
+    text = str(iso_duration).strip().upper()
+    # Ignore bare date-only forms like P0D; still allow PT… with optional leading PnD
+    match = re.match(
+        r"^P(?:\d+D)?T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)(?:\.\d+)?S)?$",
+        text,
+    )
     if not match:
         return None
     hours = int(match.group(1) or 0)
     minutes = int(match.group(2) or 0)
-    seconds = int(match.group(3) or 0)
+    seconds = int(float(match.group(3) or 0))
     return hours * 3600 + minutes * 60 + seconds
 
 
-def is_youtube_short(iso_duration):
-    """YouTube Shorts are videos ≤ 60 seconds."""
+def is_youtube_short(iso_duration, title="", description=""):
+    """
+    Detect YouTube Shorts.
+
+    Data API has no isShort flag. Heuristics:
+      - duration ≤ 180s (Shorts max is 3 minutes)
+      - #shorts / /shorts/ in title or description
+    Treat missing duration as NOT a Short only when hashtag also absent.
+    """
+    blob = f"{title or ''} {description or ''}".lower()
+    if "#shorts" in blob or "/shorts/" in blob or "youtube.com/shorts" in blob:
+        return True
     secs = duration_seconds(iso_duration)
-    return secs is not None and secs <= 60
+    # Current Shorts cap is 3 minutes
+    return secs is not None and secs <= 180
 
 
 def is_english_video(snippet):
@@ -619,7 +635,11 @@ def search_youtube_videos(
                 continue
 
             # 1) Ignore Shorts
-            if is_youtube_short(content_details.get("duration")):
+            if is_youtube_short(
+                content_details.get("duration"),
+                title=snippet.get("title") or "",
+                description=snippet.get("description") or "",
+            ):
                 continue
 
             # 3) Model reviews: English only
@@ -749,7 +769,7 @@ def fetch_recent_channel_videos(channel_id, since_ts):
         "part": "snippet",
         "channelId": channel_id,
         "order": "date",
-        "maxResults": 10,
+        "maxResults": 15,
         "type": "video",
         "key": YOUTUBE_API_KEY,
     }, timeout=HTTP_TIMEOUT)
@@ -764,9 +784,15 @@ def fetch_recent_channel_videos(channel_id, since_ts):
         published_dt = parse_datetime(snippet.get("publishedAt"))
         video_id = (item.get("id") or {}).get("videoId")
         if published_dt and video_id and published_dt.timestamp() >= since_ts:
+            # Cheap pre-filter: drop obvious Shorts before the videos.list call
+            title = snippet.get("title") or "Untitled"
+            description = snippet.get("description") or ""
+            if is_youtube_short(None, title=title, description=description):
+                continue
             recent.append({
                 "video_id": video_id,
-                "title": snippet.get("title") or "Untitled",
+                "title": title,
+                "description": description,
                 "channel_title": snippet.get("channelTitle") or "Unknown channel",
                 "_published_dt": published_dt,
             })
@@ -776,31 +802,49 @@ def fetch_recent_channel_videos(channel_id, since_ts):
     details = {}
     try:
         stats_resp = requests.get(YOUTUBE_VIDEOS_URL, params={
-            "part": "statistics,contentDetails",
+            "part": "statistics,contentDetails,snippet",
             "id": ",".join(v["video_id"] for v in recent),
             "key": YOUTUBE_API_KEY,
         }, timeout=HTTP_TIMEOUT)
         if stats_resp.status_code == 429:
-            print("[youtube] Rate limited (429) on statistics — using zeros.")
-        else:
-            raise_for_status_safe(stats_resp, "YouTube videos")
-            details = {
-                it["id"]: {
-                    "statistics": it.get("statistics") or {},
-                    "contentDetails": it.get("contentDetails") or {},
-                }
-                for it in stats_resp.json().get("items", [])
+            # Without duration we cannot safely exclude Shorts — skip channel this run
+            print(f"[youtube] Rate limited (429) on details for {channel_id} — skipping.")
+            return []
+        raise_for_status_safe(stats_resp, "YouTube videos")
+        details = {
+            it["id"]: {
+                "statistics": it.get("statistics") or {},
+                "contentDetails": it.get("contentDetails") or {},
+                "snippet": it.get("snippet") or {},
             }
+            for it in stats_resp.json().get("items", [])
+        }
     except Exception as exc:
-        print(f"[youtube] Statistics fetch failed: {safe_err(exc)}")
+        print(f"[youtube] Details fetch failed for {channel_id}: {safe_err(exc)}")
+        # Fail closed so Shorts don't leak through without duration metadata
+        return []
 
     filtered = []
     for v in recent:
-        d = details.get(v["video_id"], {})
-        # 1) Ignore Shorts for channel digests too
-        if is_youtube_short((d.get("contentDetails") or {}).get("duration")):
+        d = details.get(v["video_id"])
+        if not d:
             continue
+        cd = d.get("contentDetails") or {}
+        sn = d.get("snippet") or {}
+        title = sn.get("title") or v.get("title") or ""
+        description = sn.get("description") or v.get("description") or ""
+        duration = cd.get("duration")
+
+        # Must have duration to decide; skip unknown rather than risk a Short
+        if not duration:
+            print(f"[youtube] No duration for {v['video_id']} — skipping (Shorts safety).")
+            continue
+        if is_youtube_short(duration, title=title, description=description):
+            print(f"[youtube] Skipping Short: {title!r} ({duration})")
+            continue
+
         s = d.get("statistics") or {}
+        v["title"] = title
         v["views"] = int(s.get("viewCount") or 0)
         v["likes"] = int(s.get("likeCount") or 0)
         filtered.append(v)
