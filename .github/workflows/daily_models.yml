@@ -2,8 +2,8 @@ name: Daily Models Digest
 
 on:
   schedule:
-        # Runs at 06:00 AM Sydney time (AEST = UTC+10, so 20:00 UTC)
-    - cron: '0 20 * * *'
+        # Runs at 05:35 AM Sydney time (AEST = UTC+10, so 20:00 UTC)
+    - cron: '35 19 * * *'
   workflow_dispatch:
 
 jobs:
